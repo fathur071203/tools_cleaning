@@ -1246,6 +1246,266 @@ def process_realisasi_edukasi(df: pd.DataFrame, *, force_prefix_pt: bool = True)
 
     return out
 
+LTDBB_VALID_VARIANTS = {"G0001", "G0002", "G0003"}
+LTDBB_COLUMN_PATTERNS = {
+    "Frekuensi Pengiriman": [
+        r"\bfrekuensi\b.*\bpengiriman\b",
+        r"\bjumlah\b.*\bpengiriman\b",
+        r"\btotal\b.*\bfrekuensi\b",
+    ],
+    "Total Nominal Transaksi": [
+        r"\btotal\b.*\bnominal\b.*\btransaksi\b",
+        r"\bnominal\b.*\btransaksi\b",
+        r"\bjumlah\b.*\bnominal\b",
+    ],
+    "Negara Tujuan Pengiriman": [
+        r"\bnegara\b.*\btujuan\b.*\bpengiriman\b",
+        r"\btujuan\b.*\bnegara\b",
+    ],
+    "Kota/Kab. Tujuan Pengiriman": [
+        r"\bkota\b.*\btujuan\b.*\bpengiriman\b",
+        r"\bkab(?:upaten)?\b.*\btujuan\b.*\bpengiriman\b",
+        r"\bkota\s*kab\b.*\btujuan\b.*\bpengiriman\b",
+    ],
+}
+
+
+def _ltdbb_text(value: object) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).replace("\xa0", " ").replace("\n", " ").strip()
+    text = _WHITESPACE_RE.sub(" ", text)
+    return "" if text.casefold() in {"nan", "none"} else text
+
+
+def _ltdbb_header_key(text: object) -> str:
+    key = _ltdbb_text(text).casefold()
+    key = re.sub(r"[^0-9a-z]+", " ", key)
+    return _WHITESPACE_RE.sub(" ", key).strip()
+
+
+def _ltdbb_unique_headers(headers: list[object]) -> list[str]:
+    counts: dict[str, int] = {}
+    unique_headers: list[str] = []
+    for idx, header in enumerate(headers, start=1):
+        base = _ltdbb_text(header) or f"Kolom {idx}"
+        seen = counts.get(base, 0) + 1
+        counts[base] = seen
+        unique_headers.append(base if seen == 1 else f"{base} ({seen})")
+    return unique_headers
+
+
+def _ltdbb_parse_number(value: object) -> object:
+    if pd.isna(value):
+        return pd.NA
+
+    text = _ltdbb_text(value)
+    if text == "":
+        return pd.NA
+
+    text = re.sub(r"[^0-9,\.\-]", "", text)
+    if text in {"", "-", ".", ",", "-,"}:
+        return pd.NA
+
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif "," in text:
+        tail = text.rsplit(",", 1)[-1]
+        if tail.isdigit() and len(tail) <= 2:
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif text.count(".") > 1:
+        text = text.replace(".", "")
+
+    return pd.to_numeric(text, errors="coerce")
+
+
+def _ltdbb_extract_metadata(df_raw: pd.DataFrame) -> dict[str, object]:
+    meta: dict[str, object] = {
+        "pjp_name": None,
+        "pjp_sandi": None,
+        "periode_text": None,
+    }
+
+    candidate_lines: list[str] = []
+    for row_idx, col_idx in [(1, 2), (2, 2)]:
+        if row_idx < len(df_raw.index) and col_idx < df_raw.shape[1]:
+            text = _ltdbb_text(df_raw.iat[row_idx, col_idx])
+            if text:
+                candidate_lines.append(text)
+
+    for row_idx in range(min(10, len(df_raw.index))):
+        row_texts = [_ltdbb_text(v) for v in df_raw.iloc[row_idx].tolist()]
+        row_texts = [v for v in row_texts if v]
+        if row_texts:
+            candidate_lines.append(" | ".join(row_texts))
+
+    def _clean_value(text: str) -> str:
+        cleaned = re.sub(r"^[^:|-]*[:|-]\s*", "", text).strip()
+        return cleaned or text.strip()
+
+    for line in candidate_lines:
+        lower_line = line.casefold()
+
+        if meta["pjp_sandi"] is None:
+            sandi_match = re.search(r"\bsandi(?:\s+pjp)?\b[^0-9]*(\d{3,})", line, flags=re.IGNORECASE)
+            if sandi_match:
+                meta["pjp_sandi"] = sandi_match.group(1)
+
+        if meta["periode_text"] is None:
+            periode_match = re.search(r"\bperiode\b\s*[:|-]?\s*(.+)", line, flags=re.IGNORECASE)
+            if periode_match:
+                meta["periode_text"] = periode_match.group(1).strip()
+            elif re.search(r"\b(20\d{2}|januari|februari|maret|april|mei|juni|juli|agustus|september|oktober|november|desember|semester|triwulan|bulan)\b", lower_line):
+                meta["periode_text"] = _clean_value(line)
+
+        if meta["pjp_name"] is None:
+            name_match = re.search(
+                r"\b(?:nama\s*pjp|nama\s*penyelenggara|penyelenggara|pjp)\b\s*[:|-]\s*(.+)",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if name_match:
+                meta["pjp_name"] = name_match.group(1).strip()
+
+    for line in candidate_lines:
+        if meta["periode_text"] is None and re.search(r"\b(20\d{2}|januari|februari|maret|april|mei|juni|juli|agustus|september|oktober|november|desember)\b", line, flags=re.IGNORECASE):
+            meta["periode_text"] = _clean_value(line)
+        if meta["pjp_name"] is None and not re.search(r"\bperiode\b", line, flags=re.IGNORECASE):
+            cleaned = _clean_value(line)
+            if cleaned and not re.fullmatch(r"\d{3,}", cleaned):
+                meta["pjp_name"] = cleaned
+        if meta["pjp_sandi"] is not None and meta["pjp_name"] is not None and meta["periode_text"] is not None:
+            break
+
+    return meta
+
+
+def _ltdbb_detect_variant(columns: list[str], *, filename: str = "", metadata_blob: str = "") -> str | None:
+    text = f"{filename} {metadata_blob}".casefold()
+    column_set = set(columns)
+
+    if "Negara Tujuan Pengiriman" in column_set:
+        return "G0001"
+    if re.search(r"\bg0001\b|outgoing|luar\s+negeri", text):
+        return "G0001"
+    if re.search(r"\bg0002\b|ingoing|incoming", text):
+        return "G0002"
+    if re.search(r"\bg0003\b|domestik|domestic", text):
+        return "G0003"
+    if "Kota/Kab. Tujuan Pengiriman" in column_set:
+        return "G0002"
+    return None
+
+
+def process_ltdbb_cleaner(
+    df_raw: pd.DataFrame,
+    *,
+    filename: str = "",
+    variant_override: str | None = None,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """
+    Bersihkan template LTDBB/LKPBU mentah:
+    - gunakan baris ke-6 sebagai header
+    - buang kolom A dan B
+    - hapus banner/footer kosong atau total
+    - normalisasi nama kolom penting otomatis
+    - hitung metadata ringkas untuk dashboard
+    """
+    if variant_override and variant_override not in LTDBB_VALID_VARIANTS:
+        raise ValueError("Variant override tidak valid. Gunakan G0001, G0002, atau G0003.")
+
+    if df_raw.empty or len(df_raw.index) < 6:
+        raise ValueError("Template LTDBB tidak valid. Minimal harus memiliki 6 baris.")
+
+    metadata = _ltdbb_extract_metadata(df_raw)
+
+    header_row = [_ltdbb_text(v) for v in df_raw.iloc[5].tolist()]
+    data = df_raw.iloc[6:].copy().reset_index(drop=True)
+
+    if data.shape[1] <= 2:
+        raise ValueError("Kolom data LTDBB tidak ditemukan setelah kolom A dan B dibuang.")
+
+    header_row = header_row[2:]
+    data = data.iloc[:, 2:].copy()
+    data.columns = _ltdbb_unique_headers(header_row)
+
+    data = data.apply(lambda col: col.map(lambda value: pd.NA if _ltdbb_text(value) == "" else value))
+    data = data.dropna(axis=1, how="all").dropna(axis=0, how="all").reset_index(drop=True)
+
+    header_keys = [_ltdbb_header_key(col) for col in data.columns]
+    keep_mask: list[bool] = []
+    for _, row in data.iterrows():
+        row_values = [_ltdbb_text(v) for v in row.tolist()]
+        non_empty = [v for v in row_values if v]
+        joined = " ".join(non_empty).casefold()
+        row_keys = [_ltdbb_header_key(v) for v in non_empty]
+
+        sample_size = min(3, len(header_keys), len(row_keys))
+        is_repeated_header = sample_size >= 2 and row_keys[:sample_size] == header_keys[:sample_size]
+        is_footer = bool(
+            re.search(
+                r"\b(grand total|jumlah total|catatan|keterangan|note|dicetak pada|halaman)\b",
+                joined,
+            )
+        )
+        keep_mask.append(bool(non_empty) and not is_repeated_header and not is_footer)
+
+    data = data.loc[keep_mask].reset_index(drop=True)
+
+    rename_map: dict[str, str] = {}
+    used_targets: set[str] = set()
+    for col in data.columns:
+        key = _ltdbb_header_key(col)
+        for canonical, patterns in LTDBB_COLUMN_PATTERNS.items():
+            if canonical in used_targets:
+                continue
+            canonical_key = _ltdbb_header_key(canonical)
+            if key == canonical_key or any(re.search(pattern, key) for pattern in patterns):
+                rename_map[col] = canonical
+                used_targets.add(canonical)
+                break
+    data = data.rename(columns=rename_map)
+
+    for numeric_col in ["Frekuensi Pengiriman", "Total Nominal Transaksi"]:
+        if numeric_col in data.columns:
+            data[numeric_col] = data[numeric_col].map(_ltdbb_parse_number).astype("Float64")
+
+    for text_col in ["Negara Tujuan Pengiriman", "Kota/Kab. Tujuan Pengiriman"]:
+        if text_col in data.columns:
+            data[text_col] = data[text_col].map(lambda value: pd.NA if _ltdbb_text(value) == "" else _ltdbb_text(value))
+            mask_total = data[text_col].astype("string").str.contains(r"\btotal\b", case=False, na=False)
+            data = data.loc[~mask_total].copy()
+
+    important_cols = [
+        col for col in [
+            "Negara Tujuan Pengiriman",
+            "Kota/Kab. Tujuan Pengiriman",
+            "Frekuensi Pengiriman",
+            "Total Nominal Transaksi",
+        ] if col in data.columns
+    ]
+    if important_cols:
+        data = data.loc[~data[important_cols].isna().all(axis=1)].copy()
+
+    data = data.reset_index(drop=True)
+
+    metadata_blob = " ".join(str(value) for value in metadata.values() if value)
+    variant = variant_override or _ltdbb_detect_variant(list(data.columns), filename=filename, metadata_blob=metadata_blob)
+
+    metadata.update({
+        "variant": variant,
+        "rows": int(len(data.index)),
+        "total_frekuensi": float(data["Frekuensi Pengiriman"].fillna(0).sum()) if "Frekuensi Pengiriman" in data.columns else None,
+        "total_nominal": float(data["Total Nominal Transaksi"].fillna(0).sum()) if "Total Nominal Transaksi" in data.columns else None,
+    })
+
+    return data, metadata
+
 # --- MAIN LOGIC ---
 
 def main() -> int:
